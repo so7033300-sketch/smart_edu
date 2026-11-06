@@ -15,7 +15,7 @@ const TIMEZONE = 'Asia/Tashkent';
 
 // Telegram bot tokeni environment orqali beriladi (Render -> Environment Variables)
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TELEGRAM_API = `https://api.telegram.org/bot${8959951038:AAH8R7FS5WBOEGmcGDxnkBLUY9oTiR6E6ps}`;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -176,7 +176,7 @@ async function sendTelegramMessage(chatId, text) {
 
 // Administrator Telegram username'i (@ belgisisiz). Render Environment orqali
 // TELEGRAM_ADMIN_USERNAME bilan almashtirish mumkin.
-const ADMIN_USERNAME = (process.env.TELEGRAM_ADMIN_USERNAME || '@mubinaxon_teacher1').replace(/^@/, '').toLowerCase();
+const ADMIN_USERNAME = (process.env.TELEGRAM_ADMIN_USERNAME || 'mubinaxon_teacher1').replace(/^@/, '').toLowerCase();
 
 function escapeTgHtml(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
