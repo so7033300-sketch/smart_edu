@@ -1,6 +1,9 @@
 /* =========================================================================
    SMART QR-ATTENDANCE CRM — server.js
    Express backend + node-schedule taymerlari + Telegram bildirishnomalari
+   + Telegram BOT: /start orqali ota-onaga ID beriladi, "Holatim" tugmasi
+   bilan bugungi davomat va balansni ko'rish mumkin.
+   + Dars kunlari (lessonDays) bo'yicha avtomatik ishlash.
    ========================================================================= */
 
 const express = require('express');
@@ -14,8 +17,16 @@ const DB_FILE = path.join(__dirname, 'database.json');
 const TIMEZONE = 'Asia/Tashkent';
 
 // Telegram bot tokeni environment orqali beriladi (Render -> Environment Variables)
+// MUHIM: tokenni hech qachon kodga yoki chatga yozmang — faqat .env / Render Environment orqali!
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+
+// Admin bilan bog'lanish uchun sozlamalar
+const ADMIN_USERNAME = 'sobirov_cybersecurity'; // adminning Telegram useri (@ belgisisiz)
+// Ixtiyoriy: agar shu ID (raqamli, botga /start bosgandan keyin ko'rinadigan chat ID) Render
+// Environment Variables ichiga ADMIN_CHAT_ID nomi bilan qo'yilsa, har bir yangi ota-ona /start
+// bosganda ID uning haqida xabar avtomatik ravishda to'g'ridan-to'g'ri adminga yuboriladi.
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '';
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -26,12 +37,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 function defaultDB() {
   return {
-    students: [],   // {id, name, group, teacherId, subject, fee, studQrCode, phone, days:[], lessonStart, lessonEnd, parentChatId, balance}
+    students: [],   // {id, name, group, teacherId, fee, phone, studQrCode, lessonStart, lessonEnd, lessonDays, parentChatId, balance}
     teachers: [],   // {id, name, salary, groups: [name, ...]}
-    attendance: [], // {id, studentId, studentName, phone, date, status, time, teacherId}
+    attendance: [], // {id, studentId, studentName, date, status, time, teacherId}
     center_profit: 0,
-    history: [],    // {month, center_profit, teacher_salary: {teacherId: amount, ...}}
-    adminChatId: null // Telegram bot orqali /start bosgan administratorning chat ID si
+    history: []     // {month, center_profit, teacher_salary: {teacherId: amount, ...}}
   };
 }
 
@@ -44,19 +54,12 @@ function readDB() {
     const db = JSON.parse(raw);
     // Eski fayllarda maydon yo'q bo'lsa, xavfsiz default qiymatlar bilan to'ldiramiz
     db.students = db.students || [];
-    db.students.forEach(s => {
-      if (typeof s.phone !== 'string') s.phone = '';
-      if (typeof s.subject !== 'string') s.subject = '';
-      // Eski o'quvchilarda "days" bo'lmasa — eski xatti-harakatni buzmaslik uchun
-      // har kuni faol deb hisoblaymiz. Yangilarida forma orqali aniq tanlanadi.
-      if (!Array.isArray(s.days)) s.days = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
-    });
     db.teachers = db.teachers || [];
     db.teachers.forEach(t => { if (!Array.isArray(t.groups)) t.groups = []; });
+    db.students.forEach(s => { if (!Array.isArray(s.lessonDays)) s.lessonDays = []; });
     db.attendance = db.attendance || [];
     db.center_profit = db.center_profit || 0;
     db.history = db.history || [];
-    db.adminChatId = db.adminChatId || null;
     return db;
   } catch (e) {
     console.error('database.json o\'qishda xatolik, yangi baza yaratilmoqda:', e.message);
@@ -79,35 +82,25 @@ function genId(prefix) {
    ========================================================================= */
 
 // Hozirgi vaqtni Toshkent zonasida Date obyekti sifatida qaytaradi
-// O'zbekiston (Toshkent) soat zonasi doim UTC+5 — yozgi vaqtga o'tish yo'q (1992 yildan beri).
-// Shuning uchun Intl/ICU orqali emas, to'g'ridan-to'g'ri sobit siljish bilan hisoblaymiz —
-// bu serverning til/ICU ma'lumotlariga bog'liq bo'lmagan, har doim ishonchli usul.
-const TASHKENT_OFFSET_MS = 5 * 60 * 60 * 1000;
-
 function nowInTashkent() {
-  // Date.getTime() har doim UTC epoch (ms) qaytaradi — bu allaqachon mutlaq va
-  // serverning o'z mahalliy vaqt zonasiga bog'liq emas. Shunga sobit +5soat qo'shamiz.
-  const now = new Date();
-  return new Date(now.getTime() + TASHKENT_OFFSET_MS);
+  const s = new Date().toLocaleString('en-US', { timeZone: TIMEZONE });
+  return new Date(s);
 }
 
 // "YYYY-MM-DD" formatidagi bugungi sana (Toshkent bo'yicha)
 function todayDateStr() {
   const d = nowInTashkent();
-  // MUHIM: getUTC* metodlari ishlatiladi (getFullYear/getHours emas) — chunki
-  // "d" qiymati "haqiqiy UTC + 5soat" bo'lgan mutlaq vaqt. getUTC* uni serverning
-  // o'z mahalliy vaqt zonasiga bog'liq bo'lmagan holda to'g'ri o'qiydi.
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
   return `${yyyy}-${mm}-${dd}`;
 }
 
 // "HH:MM" formatidagi hozirgi vaqt (Toshkent bo'yicha)
 function currentTimeStr() {
   const d = nowInTashkent();
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const mi = String(d.getUTCMinutes()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
   return `${hh}:${mi}`;
 }
 
@@ -121,44 +114,49 @@ function timeStrToMinutes(t) {
 
 function currentMinutes() {
   const d = nowInTashkent();
-  return d.getUTCHours() * 60 + d.getUTCMinutes();
+  return d.getHours() * 60 + d.getMinutes();
 }
 
-// Bugungi hafta kunini qisqa kalit sifatida qaytaradi: mon, tue, wed, thu, fri, sat, sun
-const WEEKDAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+// Haftaning kunlari — JS Date.getDay() bilan mos indekslar (0 = Yakshanba)
+const WEEKDAY_KEYS = ['yak', 'dush', 'sesh', 'chor', 'pay', 'juma', 'shan'];
+const VALID_LESSON_DAYS = ['dush', 'sesh', 'chor', 'pay', 'juma', 'shan', 'yak'];
+
+// Bugungi hafta kunini kalit sifatida qaytaradi (masalan: 'dush')
 function todayWeekdayKey() {
   const d = nowInTashkent();
-  return WEEKDAY_KEYS[d.getUTCDay()];
+  return WEEKDAY_KEYS[d.getDay()];
 }
 
-// O'quvchi uchun bugun faol dars kuni ekanligini tekshiradi.
-// "days" ro'yxati bo'sh yoki bugungi kun belgilanmagan bo'lsa — hech narsa qilinmaydi
-// (xabar yuborilmaydi, pul yechilmaydi) — foydalanuvchi talabiga ko'ra.
-function isScheduledToday(student) {
-  const days = Array.isArray(student.days) ? student.days : [];
-  if (days.length === 0) return false;
+// O'quvchida bugun dars borligini tekshiradi. Agar lessonDays kiritilmagan
+// yoki bo'sh bo'lsa — eski xatti-harakat saqlanadi: har kuni dars deb hisoblanadi.
+function isLessonDayToday(student) {
+  const days = student && student.lessonDays;
+  if (!Array.isArray(days) || days.length === 0) return true;
   return days.includes(todayWeekdayKey());
 }
 
 /* =========================================================================
-   3. TELEGRAM BILDIRISHNOMA FUNKSIYASI
+   3. TELEGRAM BILDIRISHNOMA FUNKSIYASI (chiquvchi xabarlar)
    ========================================================================= */
 
-async function sendTelegramMessage(chatId, text) {
+async function sendTelegramMessage(chatId, text, replyMarkup) {
   if (!chatId) return; // parentChatId kiritilmagan bo'lsa, jim o'tkazib yuboramiz
   if (!TELEGRAM_BOT_TOKEN) {
     console.warn('TELEGRAM_BOT_TOKEN sozlanmagan — xabar yuborilmadi:', text);
     return;
   }
   try {
+    const body = {
+      chat_id: chatId,
+      text: text,
+      parse_mode: 'HTML'
+    };
+    if (replyMarkup) body.reply_markup = replyMarkup;
+
     const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text,
-        parse_mode: 'HTML'
-      })
+      body: JSON.stringify(body)
     });
     const data = await res.json();
     if (!data.ok) {
@@ -170,167 +168,152 @@ async function sendTelegramMessage(chatId, text) {
 }
 
 /* =========================================================================
-   3.1 TELEGRAM BOT — /start, ID raqamni ko'rsatish, "Adminga yuborish" tugmasi
-   Bot faqat funksional xabarlar yuboradi, hech qanday reklama/marketing matni yo'q.
+   3B. TELEGRAM BOT — KIRUVCHI XABARLARNI QABUL QILISH (long polling)
+   Ota-ona /start bosadi -> bot unga Telegram Chat ID'sini yuboradi va
+   "ID'ni adminga yuborish" tugmasini beradi. Admin shu ID'ni o'quvchi
+   profilidagi "parentChatId" maydoniga yozadi. Shundan keyin ota-ona
+   "📊 Holatim" tugmasi orqali bugungi davomat holati va joriy balansini
+   istalgan vaqtda ko'rishi mumkin.
    ========================================================================= */
 
-// Administrator Telegram username'i (@ belgisisiz). Render Environment orqali
-// TELEGRAM_ADMIN_USERNAME bilan almashtirish mumkin.
-const ADMIN_USERNAME = (process.env.TELEGRAM_ADMIN_USERNAME || 'mubinaxon_teacher1').replace(/^@/, '').toLowerCase();
+const STATUS_BUTTON_TEXT = '📊 Holatim';
 
-function escapeTgHtml(str) {
-  return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+function statusKeyboard() {
+  return {
+    keyboard: [[{ text: STATUS_BUTTON_TEXT }]],
+    resize_keyboard: true
+  };
 }
 
-function fmtSom(n) {
+// "ID'ni adminga yuborish" tugmasi — bosilganda ota-onaning o'z Telegram
+// ilovasida @sobirov_cybersecurity bilan chat ochiladi, ID matn qilib
+// avtomatik to'ldirilgan bo'ladi, ota-ona faqat "Yuborish" tugmasini bosadi.
+function adminContactKeyboard(chatId, parentName) {
+  const prefilledText = `Salom! Mening Telegram ID: ${chatId}${parentName ? ` (${parentName})` : ''}. Farzandimni Smart QR-Attendance tizimida profilga ulab bering.`;
+  return {
+    inline_keyboard: [[
+      { text: '📨 ID\'ni adminga yuborish', url: `https://t.me/${ADMIN_USERNAME}?text=${encodeURIComponent(prefilledText)}` }
+    ]]
+  };
+}
+
+// Telegram HTML parse_mode uchun maxsus belgilarni xavfsizlantiradi
+function escapeTgHtml(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function fmtMoneyTg(n) {
   const v = Number(n) || 0;
   return v.toLocaleString('ru-RU').replace(/,/g, ' ') + " so'm";
 }
 
-// Bitta Telegram chatId'ga biriktirilgan barcha o'quvchilarning balansini matn qilib qaytaradi
-function buildBalanceMessage(db, chatId) {
-  const myKids = db.students.filter(s => String(s.parentChatId) === String(chatId));
-  if (myKids.length === 0) {
-    return null;
+async function sendStatusToParent(chatId) {
+  const db = readDB();
+  const children = db.students.filter(s => String(s.parentChatId) === String(chatId));
+
+  if (children.length === 0) {
+    await sendTelegramMessage(
+      chatId,
+      `Hozircha Telegram ID'ingiz hech qaysi o'quvchi profiliga ulanmagan.\n\nSizning ID raqamingiz: <b>${chatId}</b>\n\nShu raqamni farzandingiz o'qiydigan markaz administratoriga bering — u buni tizimga kiritgandan so'ng, shu yerdan holatni kuzatishingiz mumkin bo'ladi.`
+    );
+    return;
   }
-  return myKids.map(s =>
-    `👤 <b>${escapeTgHtml(s.name)}</b>\n` +
-    `Guruh: ${escapeTgHtml(s.group) || '—'}\n` +
-    `💰 Joriy balans: ${fmtSom(s.balance)}`
-  ).join('\n\n');
+
+  const today = todayDateStr();
+  const blocks = children.map(s => {
+    const att = db.attendance.find(a => a.studentId === s.id && a.date === today);
+    let statusLine = '⏳ Bugungi davomat hali belgilanmagan';
+    if (att) statusLine = att.status === 'keldi' ? `✅ Keldi (soat ${escapeTgHtml(att.time)})` : '❌ Kelmadi';
+
+    return `👤 <b>${escapeTgHtml(s.name)}</b>\nGuruh: ${escapeTgHtml(s.group || '—')}\nBugun: ${statusLine}\nJoriy balans: ${fmtMoneyTg(s.balance)}`;
+  });
+
+  await sendTelegramMessage(chatId, blocks.join('\n\n'), statusKeyboard());
 }
 
-let telegramBot = null;
+async function handleTelegramUpdate(update) {
+  const msg = update.message;
+  if (!msg || !msg.text) return;
+  const chatId = msg.chat.id;
+  const text = msg.text.trim();
 
-function initTelegramBot() {
+  if (text === '/start') {
+    const parentName = [msg.from && msg.from.first_name, msg.from && msg.from.last_name].filter(Boolean).join(' ');
+
+    // 1-xabar: ID + "adminga yuborish" tugmasi (inline)
+    await sendTelegramMessage(
+      chatId,
+      `Assalomu alaykum! 👋\n\nSizning Telegram ID raqamingiz: <b>${chatId}</b>\n\nPastdagi tugmani bosib, ID raqamingizni to'g'ridan-to'g'ri administratorga yuborishingiz mumkin. U sizni farzandingiz profiliga ulab qo'yadi.`,
+      adminContactKeyboard(chatId, parentName)
+    );
+
+    // 2-xabar: doimiy "Holatim" tugmasi (reply keyboard alohida xabarda, chunki bir xabarda
+    // ham inline, ham reply keyboard birga ishlatilmaydi)
+    await sendTelegramMessage(
+      chatId,
+      `Admin sizni ulab bo'lgach, "${STATUS_BUTTON_TEXT}" tugmasi orqali bugungi davomat holati va balansni istalgan vaqtda ko'rishingiz mumkin bo'ladi.`,
+      statusKeyboard()
+    );
+
+    // Agar ADMIN_CHAT_ID sozlangan bo'lsa, admin haqida avtomatik ravishda xabardor qilinadi
+    if (ADMIN_CHAT_ID) {
+      const usernamePart = msg.from && msg.from.username ? `@${escapeTgHtml(msg.from.username)}` : '—';
+      await sendTelegramMessage(
+        ADMIN_CHAT_ID,
+        `🔔 Botga yangi ota-ona /start bosdi.\n\nIsm: ${escapeTgHtml(parentName || '—')}\nUsername: ${usernamePart}\nTelegram ID: <b>${chatId}</b>\n\nShu ID'ni kerakli o'quvchi profiliga ulang.`
+      );
+    }
+    return;
+  }
+
+  if (text === STATUS_BUTTON_TEXT || text.toLowerCase() === '/holat' || text.toLowerCase() === '/status') {
+    await sendStatusToParent(chatId);
+    return;
+  }
+
+  await sendTelegramMessage(
+    chatId,
+    `Buyruqni tushunmadim 🙂\n\nHolatni ko'rish uchun "${STATUS_BUTTON_TEXT}" tugmasini bosing.`,
+    statusKeyboard()
+  );
+}
+
+let telegramOffset = 0;
+let telegramPollingActive = false;
+
+async function pollTelegramUpdates() {
   if (!TELEGRAM_BOT_TOKEN) {
     console.warn('TELEGRAM_BOT_TOKEN sozlanmagan — Telegram bot ishga tushmadi.');
     return;
   }
+  if (telegramPollingActive) return; // ikki marta parallel ishga tushishning oldini olamiz
+  telegramPollingActive = true;
 
-  const { TelegramBot } = require('node-telegram-bot-api');
-  telegramBot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-
-  telegramBot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
-    const username = (msg.from.username || '').toLowerCase();
-    const fullName = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ');
-
-    // Agar shu odam administrator (@sobirov_cybersecurity) bo'lsa — uning chat ID
-    // sini bazaga saqlaymiz, shundan keyin "Adminga yuborish" xabarlari shu yerga keladi.
-    if (username && username === ADMIN_USERNAME) {
-      const db = readDB();
-      db.adminChatId = chatId;
-      writeDB(db);
-      telegramBot.sendMessage(
-        chatId,
-        `✅ Siz administrator sifatida ro'yxatdan o'tdingiz.\nEndi ota-onalarning "Adminga yuborish" xabarlari shu yerga keladi.\n\nSizning Telegram ID: <code>${chatId}</code>`,
-        { parse_mode: 'HTML' }
-      );
-      return;
-    }
-
-    telegramBot.sendMessage(
-      chatId,
-      `Assalomu alaykum${fullName ? ', ' + fullName : ''}! 👋\n\n` +
-      `Sizning Telegram ID raqamingiz:\n<code>${chatId}</code>\n\n` +
-      `Farzandingiz davomati haqida xabarlarni olish uchun ushbu ID pastdagi tugma orqali administratorga yuboriladi, u sizni tizimga qo'shib qo'yadi.`,
-      {
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '📨 Administratorga yuborish', callback_data: 'send_to_admin' }],
-            [{ text: '💰 Farzandim balansini ko\'rish', callback_data: 'check_balance' }]
-          ]
+  try {
+    const res = await fetch(`${TELEGRAM_API}/getUpdates?offset=${telegramOffset}&timeout=25`);
+    const data = await res.json();
+    if (data.ok && Array.isArray(data.result)) {
+      for (const update of data.result) {
+        telegramOffset = update.update_id + 1;
+        try {
+          await handleTelegramUpdate(update);
+        } catch (innerErr) {
+          console.error('Telegram update qayta ishlashda xatolik:', innerErr.message);
         }
       }
-    );
-
-    // Pastda doimiy ko'rinadigan tugma — istalgan vaqt bir bosish bilan balansni tekshirish uchun
-    telegramBot.sendMessage(
-      chatId,
-      'Pastdagi tugma orqali istalgan vaqtda balansni tekshirishingiz mumkin.',
-      {
-        reply_markup: {
-          keyboard: [[{ text: '💰 Balansni tekshirish' }]],
-          resize_keyboard: true
-        }
-      }
-    );
-  });
-
-  // Doimiy pastki tugma bosilganda ham xuddi /balans kabi javob beradi
-  telegramBot.onText(/💰 Balansni tekshirish/, (msg) => {
-    const chatId = msg.chat.id;
-    const db = readDB();
-    const message = buildBalanceMessage(db, chatId);
-    if (!message) {
-      telegramBot.sendMessage(chatId, '❌ Sizning Telegram ID raqamingiz hali birorta o\'quvchiga biriktirilmagan. Avval /start bosib, ID raqamingizni administratorga yuboring.');
-      return;
+    } else if (!data.ok) {
+      console.error('Telegram getUpdates javobi xato:', data.description);
     }
-    telegramBot.sendMessage(chatId, `Farzandingiz haqida ma'lumot:\n\n${message}`, { parse_mode: 'HTML' });
-  });
-
-  // Har doim tez kirish uchun /balans buyrug'i ham ishlaydi
-  telegramBot.onText(/\/balans/i, (msg) => {
-    const chatId = msg.chat.id;
-    const db = readDB();
-    const message = buildBalanceMessage(db, chatId);
-    if (!message) {
-      telegramBot.sendMessage(chatId, '❌ Sizning Telegram ID raqamingiz hali birorta o\'quvchiga biriktirilmagan. Avval /start bosib, ID raqamingizni administratorga yuboring.');
-      return;
-    }
-    telegramBot.sendMessage(chatId, `Farzandingiz haqida ma'lumot:\n\n${message}`, { parse_mode: 'HTML' });
-  });
-
-  telegramBot.on('callback_query', (query) => {
-    const chatId = query.message.chat.id;
-
-    if (query.data === 'check_balance') {
-      const db = readDB();
-      const message = buildBalanceMessage(db, chatId);
-      telegramBot.answerCallbackQuery(query.id);
-      if (!message) {
-        telegramBot.sendMessage(chatId, '❌ Sizning Telegram ID raqamingiz hali birorta o\'quvchiga biriktirilmagan. Avval ID raqamingizni "Administratorga yuborish" tugmasi orqali yuboring.');
-        return;
-      }
-      telegramBot.sendMessage(chatId, `Farzandingiz haqida ma'lumot:\n\n${message}`, { parse_mode: 'HTML' });
-      return;
-    }
-
-    if (query.data !== 'send_to_admin') return;
-
-    const username = query.from.username ? '@' + query.from.username : '(username yo\'q)';
-    const fullName = [query.from.first_name, query.from.last_name].filter(Boolean).join(' ');
-
-    const db = readDB();
-    const adminChatId = db.adminChatId;
-
-    if (!adminChatId) {
-      telegramBot.answerCallbackQuery(query.id, {
-        text: 'Administrator hali botni ishga tushirmagan. Birozdan keyin urinib ko\'ring.',
-        show_alert: true
-      });
-      return;
-    }
-
-    telegramBot.sendMessage(
-      adminChatId,
-      `📨 Yangi ota-ona ID raqamini yubordi:\n\n` +
-      `Ism: ${fullName || '—'}\nUsername: ${username}\nTelegram ID: <code>${chatId}</code>\n\n` +
-      `Ushbu ID raqamni admin panelda tegishli o'quvchining "Ota-ona Telegram ID" maydoniga kiriting.`,
-      { parse_mode: 'HTML' }
-    );
-
-    telegramBot.answerCallbackQuery(query.id, { text: '✅ Yuborildi! Administrator siz bilan bog\'lanadi.' });
-    telegramBot.sendMessage(chatId, '✅ ID raqamingiz administratorga muvaffaqiyatli yuborildi.');
-  });
-
-  telegramBot.on('polling_error', (err) => {
-    console.error('Telegram polling xatoligi:', err.message);
-  });
-
-  console.log(`Telegram bot ishga tushdi (admin: @${ADMIN_USERNAME}).`);
+  } catch (err) {
+    console.error('Telegram getUpdates so\'rovida xatolik:', err.message);
+  } finally {
+    telegramPollingActive = false;
+    setTimeout(pollTelegramUpdates, 1000);
+  }
 }
 
 /* =========================================================================
@@ -374,19 +357,13 @@ app.get('/api/students', (req, res) => {
   res.json({ success: true, students: db.students });
 });
 
-const ALLOWED_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
-function sanitizeDays(days) {
-  if (!Array.isArray(days)) return [];
-  return days.filter(d => ALLOWED_DAYS.includes(d));
-}
-
 // Yangi o'quvchi qo'shish
 app.post('/api/students', (req, res) => {
   const db = readDB();
   const {
-    name, group, teacherId, fee, subject,
-    studQrCode, lessonStart, lessonEnd,
-    parentChatId, phone, days
+    name, group, teacherId, fee, phone,
+    studQrCode, lessonStart, lessonEnd, lessonDays,
+    parentChatId
   } = req.body;
 
   if (!name || !fee) {
@@ -402,14 +379,13 @@ app.post('/api/students', (req, res) => {
     name,
     group: group || '',
     teacherId: teacherId || null,
-    subject: subject || '',
     fee: Number(fee),
     balance: 0,
-    studQrCode: studQrCode || '',
     phone: phone || '',
-    days: sanitizeDays(days),
+    studQrCode: studQrCode || '',
     lessonStart: lessonStart || '',
     lessonEnd: lessonEnd || '',
+    lessonDays: Array.isArray(lessonDays) ? lessonDays.filter(d => VALID_LESSON_DAYS.includes(d)) : [],
     parentChatId: parentChatId || ''
   };
 
@@ -427,9 +403,9 @@ app.put('/api/students/:id', (req, res) => {
   }
 
   const {
-    name, group, teacherId, fee, subject,
-    studQrCode, lessonStart, lessonEnd,
-    parentChatId, balance, phone, days
+    name, group, teacherId, fee, phone,
+    studQrCode, lessonStart, lessonEnd, lessonDays,
+    parentChatId, balance
   } = req.body;
 
   if (studQrCode && db.students.some(s => s.studQrCode === studQrCode && s.id !== student.id)) {
@@ -439,13 +415,14 @@ app.put('/api/students/:id', (req, res) => {
   if (name !== undefined) student.name = name;
   if (group !== undefined) student.group = group;
   if (teacherId !== undefined) student.teacherId = teacherId;
-  if (subject !== undefined) student.subject = subject;
   if (fee !== undefined) student.fee = Number(fee);
-  if (studQrCode !== undefined) student.studQrCode = studQrCode;
   if (phone !== undefined) student.phone = phone;
-  if (days !== undefined) student.days = sanitizeDays(days);
+  if (studQrCode !== undefined) student.studQrCode = studQrCode;
   if (lessonStart !== undefined) student.lessonStart = lessonStart;
   if (lessonEnd !== undefined) student.lessonEnd = lessonEnd;
+  if (lessonDays !== undefined) {
+    student.lessonDays = Array.isArray(lessonDays) ? lessonDays.filter(d => VALID_LESSON_DAYS.includes(d)) : [];
+  }
   if (parentChatId !== undefined) student.parentChatId = parentChatId;
   if (balance !== undefined) student.balance = Number(balance);
 
@@ -551,7 +528,8 @@ app.delete('/api/teachers/:id', (req, res) => {
 
 /* =========================================================================
    7. 🔴 JONLI QR-DAVOMAT API — POST /api/attendance/qr
-   Skaner (kamera yoki apparat) shtrix/QR kodni yuboradi, sahifa yangilanmaydi
+   Apparat skaner yoki qo'lda kiritilgan shtrix/QR kodni qabul qiladi,
+   sahifa yangilanmaydi.
    ========================================================================= */
 
 app.post('/api/attendance/qr', async (req, res) => {
@@ -574,10 +552,10 @@ app.post('/api/attendance/qr', async (req, res) => {
     });
   }
 
-  if (!isScheduledToday(student)) {
-    return res.status(409).json({
+  if (!isLessonDayToday(student)) {
+    return res.status(400).json({
       success: false,
-      message: `Bugun ${student.name} uchun dars kuni sifatida belgilanmagan.`
+      message: `${student.name} uchun bugun dars kuni emas.`
     });
   }
 
@@ -586,8 +564,6 @@ app.post('/api/attendance/qr', async (req, res) => {
     id: genId('att'),
     studentId: student.id,
     studentName: student.name,
-    phone: student.phone || '',
-    subject: student.subject || '',
     date: todayDateStr(),
     status: 'keldi',
     time,
@@ -601,7 +577,8 @@ app.post('/api/attendance/qr', async (req, res) => {
   // Ota-onaga zumda Telegram xabar (asinxron, javobni kutmasdan yuboramiz)
   sendTelegramMessage(
     student.parentChatId,
-    `Hurmatli ota-ona, farzandingiz ${student.name} bugun soat ${time} da darsga yetib keldi. ✅`
+    `Hurmatli ota-ona, farzandingiz ${student.name} bugun soat ${time} da darsga yetib keldi. ✅\n\nJoriy balans: ${fmtMoneyTg(student.balance)}`,
+    statusKeyboard()
   );
 
   const stats = computeTodayStats(db);
@@ -642,8 +619,9 @@ app.get('/api/overview', (req, res) => {
 
 /* =========================================================================
    9. AVTOMATIK POYLOQCHI TAYMER — har minutda ishlaydi
-   Dars tugash vaqti (lessonEnd) o'tgan, lekin bugun "keldi" deb belgilanmagan
-   o'quvchini avtomatik "kelmadi" deb belgilaydi va pul amallarini bajaradi.
+   Dars tugash vaqti (lessonEnd) o'tgan, bugun shu o'quvchi uchun dars kuni
+   bo'lgan (lessonDays), lekin davomat yozilmagan o'quvchini avtomatik
+   "kelmadi" deb belgilaydi va pul amallarini bajaradi.
    ========================================================================= */
 
 schedule.scheduleJob('* * * * *', async () => {
@@ -653,18 +631,16 @@ schedule.scheduleJob('* * * * *', async () => {
   let changed = false;
 
   for (const student of db.students) {
-    if (!isScheduledToday(student)) continue; // bugun bu o'quvchi uchun dars kuni emas — hech narsa qilinmaydi
-
     const endMin = timeStrToMinutes(student.lessonEnd);
     if (endMin === null) continue; // dars vaqti kiritilmagan o'quvchini o'tkazib yuboramiz
+
+    if (!isLessonDayToday(student)) continue; // bugun bu o'quvchi uchun dars kuni emas
 
     if (nowMin >= endMin && !hasAttendanceToday(db, student.id)) {
       const record = {
         id: genId('att'),
         studentId: student.id,
         studentName: student.name,
-        phone: student.phone || '',
-        subject: student.subject || '',
         date: today,
         status: 'kelmadi',
         time: currentTimeStr(),
@@ -676,7 +652,8 @@ schedule.scheduleJob('* * * * *', async () => {
 
       sendTelegramMessage(
         student.parentChatId,
-        `Hurmatli ota-ona, bugungi dars yakunlandi. Farzandingiz ${student.name} darsga KELMADI. ❌`
+        `Hurmatli ota-ona, bugungi dars yakunlandi. Farzandingiz ${student.name} darsga KELMADI. ❌\n\nJoriy balans: ${fmtMoneyTg(student.balance)}`,
+        statusKeyboard()
       );
     }
   }
@@ -697,8 +674,8 @@ schedule.scheduleJob('0 0 1 * *', () => {
   const db = readDB();
 
   const now = nowInTashkent();
-  const prevMonthDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-  const monthLabel = `${prevMonthDate.getUTCFullYear()}-${String(prevMonthDate.getUTCMonth() + 1).padStart(2, '0')}`;
+  const prevMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const monthLabel = `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, '0')}`;
 
   const teacherSalarySnapshot = {};
   db.teachers.forEach(t => {
@@ -731,8 +708,7 @@ if (!fs.existsSync(DB_FILE)) {
   writeDB(defaultDB());
 }
 
-initTelegramBot();
-
 app.listen(PORT, () => {
   console.log(`Smart QR-Attendance CRM server ${PORT}-portda ishga tushdi.`);
+  pollTelegramUpdates(); // Telegram botni ishga tushiramiz (agar token bo'lsa)
 });
