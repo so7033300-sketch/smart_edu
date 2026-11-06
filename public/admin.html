@@ -59,7 +59,13 @@
   <div class="glass scanner-block">
     <div class="section-title live"><span class="dot"></span> 🔴 JONLI QR-DAVOMAT SKANERI</div>
 
-
+              <div class="scanner-grid">
+      <div>
+        <div id="qr-reader"></div>
+        <div id="camera-status" style="margin-top:10px; font-size:0.8rem; color:var(--text-dim);"></div>
+        <div id="last-scanned" style="margin-top:4px; font-size:0.78rem; color:var(--text-dim);"></div>
+        <button type="button" class="btn primary" id="startCameraBtn" style="margin-top:10px; width:100%;">📷 Kamerani ishga tushirish</button>
+        <div class="manual-input-wrap">
           <label for="manualQrInput">Shtrix/QR kodni skaner qiling yoki qo'lda kiriting:</label>
           <input type="text" id="manualQrInput" placeholder="Skaner kutilmoqda..." autocomplete="off" autofocus />
         </div>
