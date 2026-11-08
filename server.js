@@ -10,7 +10,10 @@ const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DB_FILE = path.join(__dirname, 'database.json');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_FILE = path.join(DATA_DIR, 'database.json');
+
 const TIMEZONE = 'Asia/Tashkent';
 
 // Telegram bot tokeni environment orqali beriladi (Render -> Environment Variables)
